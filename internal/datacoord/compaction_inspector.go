@@ -249,6 +249,22 @@ func (c *compactionInspector) schedule() []CompactionTask {
 		}
 	}()
 
+	// FAIRNESS: Track Mix/Sort vs L0 admissions to prevent L0 starvation.
+	// Under heavy write workloads, Mix/Sort tasks can continuously exclude
+	// L0 tasks on the same channels. We guarantee L0 makes bounded progress
+	// by forcing admission after maxMixSortPerL0 Mix/Sort admissions.
+	const maxMixSortPerL0 = 4
+	mixSortAdmitted := 0
+	l0Admitted := 0
+
+	// Count pending L0 tasks to know if starvation is possible
+	l0PendingCount := 0
+	c.queueTasks.ForEach(func(t CompactionTask) {
+		if t.GetTaskProto().GetType() == datapb.CompactionType_Level0DeleteCompaction {
+			l0PendingCount++
+		}
+	})
+
 	// The schedule loop will stop if either:
 	// 1. no more task to schedule (the task queue is empty)
 	// 2. no available slots
@@ -260,6 +276,17 @@ func (c *compactionInspector) schedule() []CompactionTask {
 
 		switch t.GetTaskProto().GetType() {
 		case datapb.CompactionType_Level0DeleteCompaction:
+			// FAIRNESS: If Mix/Sort has been admitted too many times without
+			// admitting any L0, force admit L0 to prevent starvation even if
+			// the channel is currently excluded by an executing Mix/Sort task.
+			if mixSortAdmitted > 0 && l0Admitted == 0 && mixSortAdmitted >= maxMixSortPerL0 && l0PendingCount > 0 {
+				l0ChannelExcludes.Insert(t.GetTaskProto().GetChannel())
+				selected = append(selected, t)
+				l0Admitted++
+				mixSortAdmitted = 0 // reset counter after L0 admission
+				continue
+			}
+
 			if mixChannelExcludes.Contain(t.GetTaskProto().GetChannel()) ||
 				clusterChannelExcludes.Contain(t.GetTaskProto().GetChannel()) {
 				excluded = append(excluded, t)
@@ -267,6 +294,7 @@ func (c *compactionInspector) schedule() []CompactionTask {
 			}
 			l0ChannelExcludes.Insert(t.GetTaskProto().GetChannel())
 			selected = append(selected, t)
+			l0Admitted++
 		case datapb.CompactionType_MixCompaction, datapb.CompactionType_SortCompaction, datapb.CompactionType_BumpSchemaVersionCompaction:
 			// BumpSchemaVersionCompaction shares the same exclusion rules as Mix/Sort:
 			// - Channel-level mutual exclusion with L0 (L0 may write delta logs to any segment on the channel)
@@ -278,6 +306,7 @@ func (c *compactionInspector) schedule() []CompactionTask {
 			mixChannelExcludes.Insert(t.GetTaskProto().GetChannel())
 			mixLabelExcludes.Insert(t.GetLabel())
 			selected = append(selected, t)
+			mixSortAdmitted++
 		case datapb.CompactionType_ClusteringCompaction:
 			if l0ChannelExcludes.Contain(t.GetTaskProto().GetChannel()) ||
 				mixLabelExcludes.Contain(t.GetLabel()) ||
